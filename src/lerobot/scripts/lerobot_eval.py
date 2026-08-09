@@ -68,6 +68,7 @@ import einops
 import gymnasium as gym
 import numpy as np
 import torch
+from PIL import Image
 from termcolor import colored
 from torch import Tensor, nn
 from tqdm import trange
@@ -84,7 +85,7 @@ from lerobot.envs import (
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.types import PolicyAction
-from lerobot.utils.constants import ACTION, DONE, OBS_STR, REWARD
+from lerobot.utils.constants import ACTION, DONE, OBS_IMAGES, OBS_STR, REWARD
 from lerobot.utils.device_utils import get_safe_torch_device
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.io_utils import write_video
@@ -94,6 +95,7 @@ from lerobot.utils.utils import (
     inside_slurm,
 )
 
+import debugpy
 
 def rollout(
     env: gym.vector.VectorEnv,
@@ -165,6 +167,17 @@ def rollout(
     while not np.all(done) and step < max_steps:
         # Numpy array to tensor and changing dictionary keys to LeRobot policy format.
         observation = preprocess_observation(observation)
+
+        # DEBUG: dump the two camera views to disk for visual inspection.
+        debug_images_dir = Path("./eval_logs/debug_images")
+        debug_images_dir.mkdir(parents=True, exist_ok=True)
+        for image_key, image_tensor in observation.items():
+            if image_key.startswith(OBS_IMAGES):
+                image_array = (image_tensor[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
+                Image.fromarray(image_array).save(
+                    debug_images_dir / f"step{step:04d}_{image_key.replace('.', '_')}.png"
+                )
+
         if return_observations:
             all_observations.append(deepcopy(observation))
 
@@ -835,6 +848,11 @@ def eval_policy_all(
 
 
 def main():
+    
+    # debugpy.listen(("0.0.0", 5678))
+    # print(f"Waiting for debugger to attach on port 5678...")
+    # debugpy.wait_for_client()
+    
     init_logging()
     register_third_party_plugins()
     eval_main()

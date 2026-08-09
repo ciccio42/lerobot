@@ -92,6 +92,33 @@ LIBERO supports two control modes — `relative` (default) and `absolute`. Diffe
 --env.control_mode=relative   # or "absolute"
 ```
 
+### Spawn-region randomization (libero_object)
+
+To stress-test a policy's spatial generalization, the target object's spawn region can be resampled
+every episode instead of using the suite's default placement. This only works for suites that ship a
+`spawn_region.json` next to their bddl files — today that's `libero_object` only:
+
+```bash
+lerobot-eval \
+  --policy.path="your-policy-id" \
+  --env.type=libero \
+  --env.task=libero_object \
+  --env.change_spawn=true \
+  --env.spawn_train_distribution=false \
+  --eval.batch_size=2 \
+  --eval.n_episodes=10
+```
+
+- `--env.change_spawn` (default `false`) — when `true`, every episode rebuilds the sim from a bddl
+  file with a freshly-sampled `floor_target_object_region`.
+- `--env.spawn_train_distribution` (default `true`) — `true` samples an alternate in-distribution
+  region (the `"target"` pool in `spawn_region.json`); `false` samples an out-of-distribution region
+  taken from other objects' regions (the `"other_objects"` pool), swapping that object's region with
+  the target's vacated one so they don't end up overlapping.
+
+This rebuilds the MuJoCo scene on every reset, so expect eval to run noticeably slower than with
+`--env.change_spawn=false`.
+
 ### Policy inputs and outputs
 
 **Observations:**

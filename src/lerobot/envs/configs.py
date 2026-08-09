@@ -332,6 +332,13 @@ class LiberoEnv(EnvConfig):
     observation_height: int = 360
     observation_width: int = 360
     is_libero_plus: bool = False
+    # Resample the target object's spawn region every episode from `spawn_region.json`
+    # (only shipped today for the libero_object suite's bddl files). When True,
+    # `spawn_train_distribution` picks the candidate pool: True samples an alternate
+    # in-distribution region ("target" pool), False samples an out-of-distribution one
+    # taken from other objects' regions ("other_objects" pool).
+    change_spawn: bool = False
+    spawn_train_distribution: bool = True
     features: dict[str, PolicyFeature] = field(
         default_factory=lambda: {
             ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(7,)),
@@ -434,6 +441,8 @@ class LiberoEnv(EnvConfig):
             episode_length=self.episode_length,
             camera_name_mapping=self.camera_name_mapping,
             is_libero_plus=self.is_libero_plus,
+            change_spawn=self.change_spawn,
+            spawn_train_distribution=self.spawn_train_distribution,
         )
 
     def get_env_processors(self):

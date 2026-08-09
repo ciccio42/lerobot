@@ -32,6 +32,7 @@ from libero.libero.envs import OffScreenRenderEnv
 
 from lerobot.types import RobotObservation
 
+from .libero_spawn import sample_spawn_bddl_file
 from .utils import _LazyAsyncVectorEnv, parse_camera_names
 
 
@@ -127,10 +128,14 @@ class LiberoEnv(gym.Env):
         num_steps_wait: int = 10,
         control_mode: str = "relative",
         is_libero_plus: bool = False,
+        change_spawn: bool = False,
+        spawn_train_distribution: bool = True,
     ):
         super().__init__()
         self.task_id = task_id
         self.is_libero_plus = is_libero_plus
+        self.change_spawn = change_spawn
+        self.spawn_train_distribution = spawn_train_distribution
         self.obs_type = obs_type
         self.render_mode = render_mode
         self.observation_width = observation_width
@@ -247,6 +252,31 @@ class LiberoEnv(gym.Env):
             low=ACTION_LOW, high=ACTION_HIGH, shape=(ACTION_DIM,), dtype=np.float32
         )
 
+    def _build_env(self, bddl_file: str) -> OffScreenRenderEnv:
+        env = OffScreenRenderEnv(
+            bddl_file_name=bddl_file,
+            camera_heights=self.observation_height,
+            camera_widths=self.observation_width,
+        )
+        env.reset()
+        return env
+
+    def _rebuild_env_for_spawn_change(self) -> None:
+        """Rebuild the sim from a freshly-sampled target-object spawn region.
+
+        Called every episode (from `reset()`) when `change_spawn` is set, so each episode sees a
+        region resampled from `spawn_region.json`, matching openvla-oft's per-episode behavior.
+        """
+        if self._env is not None:
+            self._env.close()
+            self._env = None
+        candidate_bddl_file = sample_spawn_bddl_file(self._task_bddl_file, self.spawn_train_distribution)
+        try:
+            self._env = self._build_env(candidate_bddl_file)
+        finally:
+            if os.path.exists(candidate_bddl_file):
+                os.remove(candidate_bddl_file)
+
     def _ensure_env(self) -> None:
         """Create the underlying OffScreenRenderEnv on first use.
 
@@ -256,13 +286,10 @@ class LiberoEnv(gym.Env):
         """
         if self._env is not None:
             return
-        env = OffScreenRenderEnv(
-            bddl_file_name=self._task_bddl_file,
-            camera_heights=self.observation_height,
-            camera_widths=self.observation_width,
-        )
-        env.reset()
-        self._env = env
+        if self.change_spawn:
+            self._rebuild_env_for_spawn_change()
+            return
+        self._env = self._build_env(self._task_bddl_file)
 
     def render(self):
         self._ensure_env()
@@ -325,7 +352,10 @@ class LiberoEnv(gym.Env):
         )
 
     def reset(self, seed=None, **kwargs):
-        self._ensure_env()
+        if self.change_spawn:
+            self._rebuild_env_for_spawn_change()
+        else:
+            self._ensure_env()
         super().reset(seed=seed)
         self._env.seed(seed)
         raw_obs = self._env.reset()
@@ -395,6 +425,8 @@ def _make_env_fns(
     control_mode: str,
     camera_name_mapping: dict[str, str] | None = None,
     is_libero_plus: bool = False,
+    change_spawn: bool = False,
+    spawn_train_distribution: bool = True,
 ) -> list[Callable[[], LiberoEnv]]:
     """Build n_envs factory callables for a single (suite, task_id)."""
 
@@ -412,6 +444,8 @@ def _make_env_fns(
             control_mode=control_mode,
             camera_name_mapping=camera_name_mapping,
             is_libero_plus=is_libero_plus,
+            change_spawn=change_spawn,
+            spawn_train_distribution=spawn_train_distribution,
             **local_kwargs,
         )
 
@@ -435,6 +469,8 @@ def create_libero_envs(
     episode_length: int | None = None,
     camera_name_mapping: dict[str, str] | None = None,
     is_libero_plus: bool = False,
+    change_spawn: bool = False,
+    spawn_train_distribution: bool = True,
 ) -> dict[str, dict[int, Any]]:
     """
     Create vectorized LIBERO environments with a consistent return shape.
@@ -494,6 +530,8 @@ def create_libero_envs(
                 control_mode=control_mode,
                 camera_name_mapping=camera_name_mapping,
                 is_libero_plus=is_libero_plus,
+                change_spawn=change_spawn,
+                spawn_train_distribution=spawn_train_distribution,
             )
             if is_async:
                 lazy = _LazyAsyncVectorEnv(fns, cached_obs_space, cached_act_space, cached_metadata)
