@@ -119,6 +119,17 @@ lerobot-eval \
 This rebuilds the MuJoCo scene on every reset, so expect eval to run noticeably slower than with
 `--env.change_spawn=false`.
 
+<Tip warning={true}>
+
+`init_states` defaults to `true`, and takes priority over spawn randomization: after the sim is
+rebuilt from the resampled bddl file, `reset()` would otherwise immediately call
+`set_init_state()` with a fixed, recorded demo state, overwriting object positions (among the rest
+of the sim state) and silently undoing the resampled region. `LiberoEnv.reset()` now skips
+`set_init_state()` whenever `change_spawn=True`, so no extra flag is needed — but if you're
+running against an older checkout, add `--env.init_states=false` explicitly.
+
+</Tip>
+
 ### Policy inputs and outputs
 
 **Observations:**

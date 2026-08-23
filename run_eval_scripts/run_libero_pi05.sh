@@ -8,10 +8,10 @@
 #SBATCH --export=ALL
 #SBATCH --exclude=gnode09
 
-# Classic LIBERO evaluation with pi0fast.
+# Classic LIBERO evaluation with pi0.5.
 # Runs the four standard suites (Spatial, Object, Goal, Long) at 10
 # episodes/task, matching the protocol LeRobot uses for published results.
-# See: docs/source/libero.mdx, docs/source/pi0.mdx
+# See: docs/source/libero.mdx, docs/source/pi05.mdx
 
 set -euo pipefail
 
@@ -20,11 +20,11 @@ conda activate lerobot
 
 export MUJOCO_GL=egl
 
-POLICY_PATH=${POLICY_PATH:-lerobot/pi0fast-libero-v044}
+POLICY_PATH=${POLICY_PATH:-lerobot/pi05_libero_finetuned_v044}
 TASKS=${TASKS:-libero_spatial,libero_object,libero_goal,libero_10}
 N_EPISODES=${N_EPISODES:-10}
 BATCH_SIZE=${BATCH_SIZE:-1}
-OUTPUT_DIR=${OUTPUT_DIR:-./eval_logs/pi0fast}
+OUTPUT_DIR=${OUTPUT_DIR:-./eval_logs/pi05_libero}
 
 export HF_HOME=${HF_HOME:-/mnt/beegfs/frosa/checkpoint_save_folder/checkpoint_save_folder}
 export HUGGINGFACE_HUB_CACHE=${HUGGINGFACE_HUB_CACHE:-"${HF_HOME}/hub"}
@@ -39,6 +39,4 @@ srun lerobot-eval \
     --env.max_parallel_tasks=1 \
     --eval.batch_size="${BATCH_SIZE}" \
     --eval.n_episodes="${N_EPISODES}" \
-    --output_dir="${OUTPUT_DIR}" \
-    --rename_map='{"observation.images.image": "observation.images.base_0_rgb", "observation.images.image2": "observation.images.left_wrist_0_rgb"}' \
-    --policy.validate_action_token_prefix=false
+    --output_dir="${OUTPUT_DIR}"

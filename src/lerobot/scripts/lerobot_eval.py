@@ -52,6 +52,7 @@ You can learn about the CLI options for this script in the `EvalPipelineConfig` 
 import concurrent.futures as cf
 import json
 import logging
+import os
 import threading
 import time
 from collections import defaultdict
@@ -97,6 +98,11 @@ from lerobot.utils.utils import (
 
 import debugpy
 
+# Debug flag: set LEROBOT_EVAL_DEBUG_IMAGES=1 to dump the policy's input camera views to disk
+# (see `debug_images_dir` plumbing in rollout/eval_policy/eval_one/run_one/eval_policy_all).
+DEBUG_SAVE_IMAGES_ENV_VAR = "LEROBOT_EVAL_DEBUG_IMAGES"
+
+
 def rollout(
     env: gym.vector.VectorEnv,
     policy: PreTrainedPolicy,
@@ -107,6 +113,7 @@ def rollout(
     seeds: list[int] | None = None,
     return_observations: bool = False,
     render_callback: Callable[[gym.vector.VectorEnv], None] | None = None,
+    debug_images_dir: Path | None = None,
 ) -> dict:
     """Run a batched policy rollout once through a batch of environments.
 
@@ -136,10 +143,15 @@ def rollout(
             are returned optionally because they typically take more memory to cache. Defaults to False.
         render_callback: Optional rendering callback to be used after the environments are reset, and after
             every step.
+        debug_images_dir: If set, dump the policy's preprocessed input camera views (one PNG per
+            camera, per env-batch-slot, per step) to this directory for visual inspection.
     Returns:
         The dictionary described above.
     """
     assert isinstance(policy, nn.Module), "Policy must be a PyTorch nn module."
+
+    if debug_images_dir is not None:
+        debug_images_dir.mkdir(parents=True, exist_ok=True)
 
     # Reset the policy and environments.
     policy.reset()
@@ -168,15 +180,16 @@ def rollout(
         # Numpy array to tensor and changing dictionary keys to LeRobot policy format.
         observation = preprocess_observation(observation)
 
-        # DEBUG: dump the two camera views to disk for visual inspection.
-        debug_images_dir = Path("./eval_logs/debug_images")
-        debug_images_dir.mkdir(parents=True, exist_ok=True)
-        for image_key, image_tensor in observation.items():
-            if image_key.startswith(OBS_IMAGES):
-                image_array = (image_tensor[0].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-                Image.fromarray(image_array).save(
-                    debug_images_dir / f"step{step:04d}_{image_key.replace('.', '_')}.png"
-                )
+        if debug_images_dir is not None:
+            for image_key, image_tensor in observation.items():
+                if image_key.startswith(OBS_IMAGES):
+                    for env_idx in range(image_tensor.shape[0]):
+                        image_array = (
+                            image_tensor[env_idx].permute(1, 2, 0).cpu().numpy() * 255
+                        ).astype(np.uint8)
+                        Image.fromarray(image_array).save(
+                            debug_images_dir / f"env{env_idx}_step{step:04d}_{image_key.replace('.', '_')}.png"
+                        )
 
         if return_observations:
             all_observations.append(deepcopy(observation))
@@ -286,6 +299,7 @@ def eval_policy(
     videos_dir: Path | None = None,
     return_episode_data: bool = False,
     start_seed: int | None = None,
+    debug_images_dir: Path | None = None,
 ) -> dict:
     """
     Args:
@@ -294,6 +308,8 @@ def eval_policy(
         n_episodes: The number of episodes to evaluate.
         max_episodes_rendered: Maximum number of episodes to render into videos.
         videos_dir: Where to save rendered videos.
+        debug_images_dir: If set, dump the policy's input camera views per batch to
+            `debug_images_dir/batch{batch_ix}/`. See `rollout`'s docstring.
         return_episode_data: Whether to return episode data for online training. Incorporates the data into
             the "episodes" key of the returned dictionary.
         start_seed: The first seed to use for the first individual rollout. For all subsequent rollouts the
@@ -374,6 +390,7 @@ def eval_policy(
             seeds=list(seeds) if seeds else None,
             return_observations=return_episode_data,
             render_callback=render_frame if max_episodes_rendered > 0 else None,
+            debug_images_dir=debug_images_dir / f"batch{batch_ix}" if debug_images_dir is not None else None,
         )
 
         # Figure out where in each rollout sequence the first done condition was encountered (results after
@@ -576,6 +593,13 @@ def eval_main(cfg: EvalPipelineConfig):
     # Create environment-specific preprocessor and postprocessor (e.g., for LIBERO environments)
     env_preprocessor, env_postprocessor = make_env_pre_post_processors(env_cfg=cfg.env, policy_cfg=cfg.policy)
 
+    debug_images_dir = None
+    if os.environ.get(DEBUG_SAVE_IMAGES_ENV_VAR) == "1":
+        debug_images_dir = Path(cfg.output_dir) / "debug_images"
+        logging.info(
+            colored("Debug images:", "yellow", attrs=["bold"]) + f" saving policy input views to {debug_images_dir}"
+        )
+
     with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
         info = eval_policy_all(
             envs=envs,
@@ -589,6 +613,7 @@ def eval_main(cfg: EvalPipelineConfig):
             videos_dir=Path(cfg.output_dir) / "videos",
             start_seed=cfg.seed,
             max_parallel_tasks=cfg.env.max_parallel_tasks,
+            debug_images_dir=debug_images_dir,
         )
         print("Overall Aggregated Metrics:")
         print(info["overall"])
@@ -631,6 +656,7 @@ def eval_one(
     videos_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
+    debug_images_dir: Path | None = None,
 ) -> TaskMetrics:
     """Evaluates one task_id of one suite using the provided vec env."""
 
@@ -648,6 +674,7 @@ def eval_one(
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        debug_images_dir=debug_images_dir,
     )
 
     per_episode = task_result["per_episode"]
@@ -674,6 +701,7 @@ def run_one(
     videos_dir: Path | None,
     return_episode_data: bool,
     start_seed: int | None,
+    debug_images_dir: Path | None = None,
 ):
     """
     Run eval_one for a single (task_group, task_id, env).
@@ -684,6 +712,8 @@ def run_one(
     if videos_dir is not None:
         task_videos_dir = videos_dir / f"{task_group}_{task_id}"
         task_videos_dir.mkdir(parents=True, exist_ok=True)
+
+    task_debug_images_dir = debug_images_dir / f"{task_group}_{task_id}" if debug_images_dir is not None else None
 
     # Call the existing eval_one (assumed to return TaskMetrics-like dict)
     metrics = eval_one(
@@ -698,6 +728,7 @@ def run_one(
         videos_dir=task_videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        debug_images_dir=task_debug_images_dir,
     )
     # ensure we always provide video_paths key to simplify accumulation
     if max_episodes_rendered > 0:
@@ -719,6 +750,7 @@ def eval_policy_all(
     return_episode_data: bool = False,
     start_seed: int | None = None,
     max_parallel_tasks: int = 1,
+    debug_images_dir: Path | None = None,
 ) -> dict:
     """
     Evaluate a nested `envs` dict: {task_group: {task_id: vec_env}}.
@@ -774,6 +806,7 @@ def eval_policy_all(
         videos_dir=videos_dir,
         return_episode_data=return_episode_data,
         start_seed=start_seed,
+        debug_images_dir=debug_images_dir,
     )
 
     if max_parallel_tasks <= 1:

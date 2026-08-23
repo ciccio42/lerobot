@@ -49,9 +49,11 @@ be submitted from anywhere.
 
 ### 1. `run_libero_pi0.sh` — classic LIBERO, pi0
 
-Evaluates `lerobot/pi0_libero` across the four standard suites
+Evaluates `lerobot/pi0_libero_finetuned_v044` across the four standard suites
 (Spatial, Object, Goal, Long) at 10 episodes/task — the protocol used for
-LeRobot's published results.
+LeRobot's published results. Its `input_features` already use
+`observation.images.{image,image2}`, matching the LIBERO env natively, so
+no `--rename_map` is needed.
 
 ```bash
 sbatch run_libero_pi0.sh
@@ -66,10 +68,29 @@ POLICY_PATH=lerobot/pi0_libero_finetuned TASKS=libero_object N_EPISODES=5 \
 
 ### 2. `run_libero_pi0fast.sh` — classic LIBERO, pi0fast
 
-Same protocol, using `lerobot/pi0fast-libero`. pi0fast expects
-`observation.images.{base_0_rgb,left_wrist_0_rgb}` while the LIBERO env
-returns `observation.images.{image,image2}`, so the script passes a
-`--rename_map` to bridge the two (see `docs/source/rename_map.mdx`).
+Same protocol, using `lerobot/pi0fast-libero-v044`. pi0fast expects
+`observation.images.{base_0_rgb,left_wrist_0_rgb}` (plus a policy-side
+`empty_camera_0` padding slot from `empty_cameras=1`, which the env doesn't
+need to supply — see `validate_visual_features_consistency`) while the
+LIBERO env returns `observation.images.{image,image2}`, so the script passes
+a `--rename_map` to bridge the two (see `docs/source/rename_map.mdx`).
+
+- **`jadechoghari/fast-libero-tokenizer-mean-std`'s action tokenizer fails to
+  load via plain `AutoProcessor.from_pretrained(..., trust_remote_code=True)`**
+  with a misleading `... install sentencepiece or tiktoken ...` error, in
+  *two* call sites: `PI0FastPolicy.__init__` (`modeling_pi0_fast.py`) and
+  `ActionTokenizerProcessorStep.__post_init__`
+  (`processor/tokenizer_processor.py`). Root cause: a `transformers`
+  `ProcessorMixin` bug — its generic sub-component loader only treats a
+  tokenizer attribute as "primary" (loaded from the repo root) when it's
+  named exactly `tokenizer`; this repo's custom processor names its
+  attribute `bpe_tokenizer`, so `transformers` looks for it in a
+  `bpe_tokenizer/` subfolder that doesn't exist, and falls through to a slow→
+  fast conversion path that also fails. Both call sites now fall back to a
+  `_load_action_tokenizer()` helper that loads the tokenizer and processor
+  class manually (present in both files) when the primary path raises
+  `ValueError`. Only bites `action_tokenizer_name` repos using this
+  `bpe_tokenizer`-attribute pattern; harmless/unreachable otherwise.
 
 ```bash
 sbatch run_libero_pi0fast.sh
@@ -78,7 +99,54 @@ sbatch run_libero_pi0fast.sh
 Same override variables as above (`POLICY_PATH`, `TASKS`, `N_EPISODES`,
 `BATCH_SIZE`, `OUTPUT_DIR`).
 
-### 3. `run_libero_object_spawn.sh` — customized libero_object, spawn randomization
+### 3. `run_libero_pi05.sh` — classic LIBERO, pi0.5
+
+Same protocol, using `lerobot/pi05_libero_finetuned_v044` (the checkpoint
+`docs/source/pi05.mdx`'s "Reproducing published results" section refers to
+as `pi05_libero_finetuned` — same repo, both names resolve to it). Like pi0,
+its `input_features` already use `observation.images.{image,image2}`
+natively and it doesn't use an external action tokenizer, so no
+`--rename_map` is needed.
+
+```bash
+sbatch run_libero_pi05.sh
+```
+
+Same override variables as above (`POLICY_PATH`, `TASKS`, `N_EPISODES`,
+`BATCH_SIZE`, `OUTPUT_DIR`).
+
+### 4. `run_libero_molmoact2.sh` — classic LIBERO, MolmoAct2
+
+Evaluates `allenai/MolmoAct2-LIBERO-LeRobot`, following the "Evaluation With
+LeRobot MolmoAct2 Weight" recipe in `docs/source/molmoact2.mdx` exactly
+(`policy.inference_action_mode=continuous`, `bfloat16`+AMP, CUDA-graph
+inference, per-episode seeding, and `--env.camera_name_mapping` to map LIBERO's
+raw camera names — MolmoAct2 expects `image`/`wrist_image`, not LeRobot's own
+`image`/`image2` convention). Large model (~7B-class VLM backbone); expect
+several minutes just to download/load weights before rollouts start.
+
+```bash
+sbatch run_libero_molmoact2.sh
+```
+
+Same override variables as above (`POLICY_PATH`, `TASKS`, `N_EPISODES`,
+`BATCH_SIZE`, `OUTPUT_DIR`).
+
+### 5. `run_libero_vla_jepa.sh` — classic LIBERO, VLA-JEPA
+
+Evaluates `lerobot/VLA-JEPA-LIBERO` (a JEPA world-model policy), following
+the "Reproducing the LIBERO results" recipe in `docs/source/vla_jepa.mdx`.
+No `--rename_map` needed. Note the doc's reference command uses
+`--eval.batch_size=5` (not 1) — kept as this script's default.
+
+```bash
+sbatch run_libero_vla_jepa.sh
+```
+
+Same override variables as above (`POLICY_PATH`, `TASKS`, `N_EPISODES`,
+`BATCH_SIZE`, `OUTPUT_DIR`).
+
+### 6. `run_libero_object_spawn.sh` — customized libero_object, spawn randomization
 
 Ports the spawn-region randomization used in
 `openvla-oft/experiments/robot/libero/run_libero_eval.sh` /
@@ -90,11 +158,15 @@ suite. Every episode rebuilds the MuJoCo scene from a bddl file with a
 freshly-sampled `floor_target_object_region`, so it runs noticeably slower
 than the classic scripts above.
 
-Takes the policy family as a positional arg (`pi0` default, or `pi0fast`):
+Takes the policy family as a positional arg (`pi0` default, `pi0fast`,
+`pi05`, `molmoact2`, or `vla_jepa`):
 
 ```bash
 sbatch run_libero_object_spawn.sh pi0
 sbatch run_libero_object_spawn.sh pi0fast
+sbatch run_libero_object_spawn.sh pi05
+sbatch run_libero_object_spawn.sh molmoact2
+sbatch run_libero_object_spawn.sh vla_jepa
 ```
 
 `--env.spawn_train_distribution=false` (the default here, matching
@@ -105,8 +177,33 @@ openvla-oft) samples an out-of-distribution spawn region; pass
 SPAWN_TRAIN_DISTRIBUTION=true sbatch run_libero_object_spawn.sh pi0
 ```
 
+`OUTPUT_DIR` defaults to
+`./eval_logs/libero_object_spawn_<policy>_<train_dist|ood_dist>`, so both
+distributions for the same policy get separate directories automatically.
+
 Other overrides: `POLICY_PATH`, `N_EPISODES` (default 10), `BATCH_SIZE`
-(default 2), `OUTPUT_DIR`.
+(per-policy default: 2 for pi0/pi0fast/pi05, 1 for molmoact2, 5 for
+vla_jepa), `OUTPUT_DIR`.
+
+- **This script was missing `conda activate lerobot` and `--exclude=gnode09`**
+  (present in all the other scripts in this dir) — fixed; without them it
+  failed immediately with `lerobot-eval: No such file or directory` or a
+  SLURM `TaskProlog failed` on that node.
+- **Spawn randomization silently had no effect** because `LiberoEnv`
+  defaults `init_states=True`, and neither this script nor
+  `docs/source/libero.mdx`'s own example set `--env.init_states=false`. Every
+  reset rebuilt the sim from a freshly-resampled bddl file (correctly moving
+  the target object), but then immediately called `set_init_state()` on the
+  fixed, recorded demo state — which overwrites the *entire* sim state,
+  object positions included, undoing the randomization. Fixed in
+  `src/lerobot/envs/libero.py`'s `LiberoEnv.reset()`: `set_init_state()` is
+  now skipped whenever `change_spawn=True`. Verified by resetting a
+  `libero_object` task 4 times with `change_spawn=True` and reading back the
+  target object's body position from `sim.data.get_body_xpos()` each time —
+  it now actually varies between resets. Any spawn-eval results produced
+  before this fix (including this script's earlier runs) never tested spawn
+  generalization at all — they silently ran the fixed default layout every
+  episode and should be disregarded/rerun.
 
 ## Notes
 
@@ -115,6 +212,8 @@ Other overrides: `POLICY_PATH`, `N_EPISODES` (default 10), `BATCH_SIZE`
 - Results and logs are written under `--output_dir` (defaults to
   `./eval_logs/<name>` relative to the repo root, i.e.
   `lerobot/lerobot/eval_logs/...`).
-- For a from-scratch multi-suite pi0.5 reproduction command (not wrapped
-  here yet), see the "Reproducing published results" section of
-  `docs/source/libero.mdx`.
+- Set `LEROBOT_EVAL_DEBUG_IMAGES=1` (env var, off by default) before
+  `sbatch`-ing any of these to dump the policy's preprocessed camera inputs
+  as PNGs under `<output_dir>/debug_images/<suite>_<task_id>/batch<N>/` —
+  useful for sanity-checking what the policy actually sees. See the
+  `debug_images_dir` plumbing in `scripts/lerobot_eval.py`.

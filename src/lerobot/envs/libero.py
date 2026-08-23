@@ -359,7 +359,7 @@ class LiberoEnv(gym.Env):
         super().reset(seed=seed)
         self._env.seed(seed)
         raw_obs = self._env.reset()
-        if self.init_states and self._init_states is not None:
+        if self.init_states and self._init_states is not None and not self.change_spawn:
             raw_obs = self._env.set_init_state(self._init_states[self.init_state_id % len(self._init_states)])
             self.init_state_id += self._reset_stride  # Change init_state_id when reset
 

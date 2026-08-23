@@ -15,6 +15,7 @@
 # limitations under the License.
 
 import builtins
+import json
 import logging
 from collections import deque
 from pathlib import Path
@@ -35,6 +36,7 @@ else:
 
 if TYPE_CHECKING or _transformers_available:
     from transformers import AutoProcessor, AutoTokenizer
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
     from transformers.models.auto import CONFIG_MAPPING
 
     from ..pi_gemma import (
@@ -810,6 +812,33 @@ class PI0FastPytorch(nn.Module):  # see openpi `PI0Pytorch`
         return generated_action_tokens
 
 
+def _load_action_tokenizer(pretrained_model_name_or_path: str):
+    """Load a custom (`trust_remote_code`) action-tokenizer `Processor` from the Hub.
+
+    Works around a `transformers` `ProcessorMixin.from_pretrained` bug: its generic
+    sub-component loader only treats a tokenizer attribute as "primary" (loaded from the repo
+    root) when it's named exactly `tokenizer`; any other name (e.g. `bpe_tokenizer`, as used by
+    `lerobot/fast-action-tokenizer`-style repos) is treated as a *secondary* tokenizer and loaded
+    from a same-named subfolder that doesn't exist in these repos, raising a misleading
+    "install sentencepiece or tiktoken" error. `AutoTokenizer.from_pretrained` on the same repo
+    (no subfolder) works fine, so we load the pieces ourselves and construct the processor class
+    manually instead of going through `AutoProcessor.from_pretrained`.
+    """
+    processor_class = get_class_from_dynamic_module(
+        "processing_action_tokenizer.UniversalActionProcessor", pretrained_model_name_or_path
+    )
+    bpe_tokenizer = AutoTokenizer.from_pretrained(pretrained_model_name_or_path, trust_remote_code=True)
+
+    from huggingface_hub import hf_hub_download
+
+    config_path = hf_hub_download(pretrained_model_name_or_path, "processor_config.json")
+    processor_config = json.loads(Path(config_path).read_text())
+    processor_config.pop("auto_map", None)
+    processor_config.pop("processor_class", None)
+
+    return processor_class(bpe_tokenizer, **processor_config)
+
+
 class PI0FastPolicy(PreTrainedPolicy):
     """PI0Fast Policy for LeRobot."""
 
@@ -834,9 +863,12 @@ class PI0FastPolicy(PreTrainedPolicy):
         # Load tokenizers first
         try:
             # Load FAST tokenizer
-            self.action_tokenizer = AutoProcessor.from_pretrained(
-                config.action_tokenizer_name, trust_remote_code=True
-            )
+            try:
+                self.action_tokenizer = AutoProcessor.from_pretrained(
+                    config.action_tokenizer_name, trust_remote_code=True
+                )
+            except ValueError:
+                self.action_tokenizer = _load_action_tokenizer(config.action_tokenizer_name)
 
             # Load PaliGemma tokenizer for token conversion
             self._paligemma_tokenizer = AutoTokenizer.from_pretrained(

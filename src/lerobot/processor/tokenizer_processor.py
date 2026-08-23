@@ -23,8 +23,10 @@ token IDs and attention masks, which are then added to the observation dictionar
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -46,9 +48,39 @@ from .pipeline import ActionProcessorStep, ObservationProcessorStep, ProcessorSt
 # Conditional import for type checking and lazy loading
 if TYPE_CHECKING or _transformers_available:
     from transformers import AutoProcessor, AutoTokenizer
+    from transformers.dynamic_module_utils import get_class_from_dynamic_module
 else:
     AutoProcessor = None
     AutoTokenizer = None
+
+
+def _load_action_tokenizer(pretrained_model_name_or_path: str, trust_remote_code: bool):
+    """Load a custom (`trust_remote_code`) action-tokenizer `Processor` from the Hub.
+
+    Works around a `transformers` `ProcessorMixin.from_pretrained` bug: its generic
+    sub-component loader only treats a tokenizer attribute as "primary" (loaded from the repo
+    root) when it's named exactly `tokenizer`; any other name (e.g. `bpe_tokenizer`, as used by
+    `lerobot/fast-action-tokenizer`-style repos) is treated as a *secondary* tokenizer and loaded
+    from a same-named subfolder that doesn't exist in these repos, raising a misleading
+    "install sentencepiece or tiktoken" error. `AutoTokenizer.from_pretrained` on the same repo
+    (no subfolder) works fine, so we load the pieces ourselves and construct the processor class
+    manually instead of going through `AutoProcessor.from_pretrained`.
+    """
+    processor_class = get_class_from_dynamic_module(
+        "processing_action_tokenizer.UniversalActionProcessor", pretrained_model_name_or_path
+    )
+    bpe_tokenizer = AutoTokenizer.from_pretrained(
+        pretrained_model_name_or_path, trust_remote_code=trust_remote_code
+    )
+
+    from huggingface_hub import hf_hub_download
+
+    config_path = hf_hub_download(pretrained_model_name_or_path, "processor_config.json")
+    processor_config = json.loads(Path(config_path).read_text())
+    processor_config.pop("auto_map", None)
+    processor_config.pop("processor_class", None)
+
+    return processor_class(bpe_tokenizer, **processor_config)
 
 
 @dataclass
@@ -376,9 +408,14 @@ class ActionTokenizerProcessorStep(ActionProcessorStep):
         elif self.action_tokenizer_name is not None:
             if AutoProcessor is None:
                 raise ImportError("AutoProcessor is not available")
-            self.action_tokenizer = AutoProcessor.from_pretrained(
-                self.action_tokenizer_name, trust_remote_code=self.trust_remote_code
-            )
+            try:
+                self.action_tokenizer = AutoProcessor.from_pretrained(
+                    self.action_tokenizer_name, trust_remote_code=self.trust_remote_code
+                )
+            except ValueError:
+                self.action_tokenizer = _load_action_tokenizer(
+                    self.action_tokenizer_name, self.trust_remote_code
+                )
         else:
             raise ValueError(
                 "Either 'action_tokenizer' or 'action_tokenizer_name' must be provided. "
