@@ -301,9 +301,23 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         processor_kwargs["dataset_meta"] = dataset.meta
 
     if not cfg.is_reward_model_training and processor_pretrained_path is not None:
+        # Most policies register their normalizer/unnormalizer steps under the generic
+        # "normalizer_processor"/"unnormalizer_processor" names, but some (e.g. MolmoAct2, whose
+        # masked-passthrough gripper handling needs its own step class) register under their own
+        # name instead. Resuming any such policy would otherwise hit a hard KeyError from
+        # PolicyProcessorPipeline.from_pretrained's override validation ("Override keys [...] do
+        # not match any step in the saved configuration") since the generic key simply isn't
+        # present. The MolmoAct2 step classes are plain subclasses of NormalizerProcessorStep/
+        # UnnormalizerProcessorStep with no extra constructor args, so the same override kwargs
+        # shape below applies unchanged — only the lookup key differs.
+        normalizer_step_key = "normalizer_processor"
+        unnormalizer_step_key = "unnormalizer_processor"
+        if policy.config.type == "molmoact2":
+            normalizer_step_key = "molmoact2_masked_normalizer"
+            unnormalizer_step_key = "molmoact2_masked_unnormalizer"
         preprocessor_overrides = {
             "device_processor": {"device": device.type},
-            "normalizer_processor": {
+            normalizer_step_key: {
                 "stats": dataset.meta.stats,
                 "features": {**policy.config.input_features, **policy.config.output_features},
                 "norm_map": policy.config.normalization_mapping,
@@ -311,7 +325,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             "rename_observations_processor": {"rename_map": cfg.rename_map},
         }
         postprocessor_overrides = {
-            "unnormalizer_processor": {
+            unnormalizer_step_key: {
                 "stats": dataset.meta.stats,
                 "features": policy.config.output_features,
                 "norm_map": policy.config.normalization_mapping,

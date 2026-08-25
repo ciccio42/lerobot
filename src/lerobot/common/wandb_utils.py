@@ -109,7 +109,12 @@ class WandBLogger:
             save_code=False,
             # TODO(rcadene): split train and eval, and run async eval with job_type="eval"
             job_type="train_eval",
-            resume="must" if cfg.resume else None,
+            # "must" hard-fails ("run has not been initialized") whenever wandb can't verify the
+            # run against its backend from this node — a transient network/backend hiccup then
+            # crashes the whole training process, which is fatal for a long resume chain (every
+            # future resume would hit the exact same crash). "allow" resumes when possible and
+            # otherwise degrades to continuing under the same run id without hard-failing.
+            resume="allow" if cfg.resume else None,
             mode=self.cfg.mode if self.cfg.mode in ["online", "offline", "disabled"] else "online",
         )
         run_id = wandb.run.id
