@@ -181,3 +181,4 @@ outputs/
 *.mp4
 eval_logs/
 *out
+colosseum/
