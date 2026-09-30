@@ -37,6 +37,12 @@ def predict():
     payload = request.get_json()
     device = STATE["device"]
 
+    # Chunking policies (e.g. pi0.5) keep an internal action queue across select_action() calls;
+    # without a reset at each episode start, episode N+1 would begin by replaying leftovers of
+    # episode N's last chunk. The client sends reset=true on an episode's first step.
+    if payload.get("reset"):
+        STATE["policy"].reset()
+
     batch = {"task": [payload["task_description"]]}
     for key, b64_png in payload["images"].items():
         img = decode_image(b64_png)  # HWC uint8
@@ -71,12 +77,19 @@ def main():
     # MolmoAct2 refuses to run select_action() without this set explicitly (it has no default —
     # see configuration_molmoact2.py::resolve_inference_action_mode). Other policy types ignore it.
     parser.add_argument("--inference_action_mode", default="continuous", choices=["continuous", "discrete"])
+    # For chunking policies (pi0/pi0.5): how many actions of each predicted chunk to execute
+    # open-loop before re-planning. 0 keeps the checkpoint's own n_action_steps (50 for pi0.5).
+    parser.add_argument("--n_action_steps", type=int, default=0)
     args = parser.parse_args()
 
     cfg = PreTrainedConfig.from_pretrained(args.policy_path)
     cfg.device = args.device
     if cfg.type == "molmoact2":
         cfg.inference_action_mode = args.inference_action_mode
+    if args.n_action_steps > 0 and hasattr(cfg, "n_action_steps"):
+        assert args.n_action_steps <= cfg.chunk_size, "n_action_steps must be <= chunk_size"
+        cfg.n_action_steps = args.n_action_steps
+        print(f"Overriding n_action_steps -> {cfg.n_action_steps} (chunk_size={cfg.chunk_size})")
     postprocessor_overrides = {}
     flip_gripper_sign = False
     if cfg.type == "vla_jepa":
