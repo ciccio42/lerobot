@@ -304,6 +304,8 @@ class LiberoEnv(gym.Env):
         images = {}
         for camera_name in self.camera_name:
             image = raw_obs[camera_name]
+            if image.dtype != np.uint8:  # LIBERO-plus blur perturbations can return float images in [0, 255]
+                image = np.clip(image, 0, 255).astype(np.uint8)
             images[self.camera_name_mapping[camera_name]] = image
 
         eef_pos = raw_obs.get("robot0_eef_pos")

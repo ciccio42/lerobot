@@ -14,7 +14,9 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 from collections import deque
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -38,6 +40,8 @@ else:
 
 from .action_head import VLAJEPAActionHead
 from .configuration_vla_jepa import VLAJEPAConfig
+from .demo_bank import DemoVideoBank, normalize_instruction
+from .demo_resampler import DemoResampler
 from .qwen_interface import Qwen3VLInterface
 from .world_model import ActionConditionedVideoPredictor
 
@@ -79,13 +83,19 @@ class VLAJEPAModel(nn.Module):
         # Action head (flow-matching DiT)
         self.action_model = VLAJEPAActionHead(config, cross_attention_dim=self.qwen.model.config.hidden_size)
 
-        # JEPA world model components
-        if config.enable_world_model:
+        # JEPA world model components (the V-JEPA encoder is also the demo encoder in option A)
+        use_vjepa_demo = config.use_demo and config.demo_encoder == "vjepa"
+        if config.enable_world_model or use_vjepa_demo:
             self.video_encoder = AutoModel.from_pretrained(
                 config.jepa_encoder_name,
                 torch_dtype=self.qwen._get_torch_dtype(config.torch_dtype),
             )
             self.video_processor = AutoVideoProcessor.from_pretrained(config.jepa_encoder_name)
+        else:
+            self.video_encoder = None
+            self.video_processor = None
+
+        if config.enable_world_model:
             num_views = config.jepa_tubelet_size
             tubelet_size = self.video_encoder.config.tubelet_size
             image_size = getattr(self.video_encoder.config, "image_size", None)
@@ -106,9 +116,36 @@ class VLAJEPAModel(nn.Module):
                 num_action_tokens_per_step=config.num_action_tokens_per_timestep,
             )
         else:
-            self.video_encoder = None
-            self.video_processor = None
             self.video_predictor = None
+
+        # Demo-video conditioning (option A): V-JEPA2 demo features -> K <|demo|> token embeddings
+        if use_vjepa_demo:
+            self.demo_token_id = self.qwen.processor.tokenizer.convert_tokens_to_ids(config.demo_token)
+            embed_weight = self.qwen.model.get_input_embeddings().weight
+            self.demo_resampler = DemoResampler(
+                in_dim=self.video_encoder.config.hidden_size,
+                out_dim=self.qwen.model.config.hidden_size,
+                num_tokens=config.demo_num_tokens,
+                depth=config.demo_resampler_depth,
+                num_heads=config.demo_resampler_num_heads,
+                embed_rms=embed_weight.detach().float().pow(2).mean().sqrt().item(),
+            )
+        else:
+            self.demo_token_id = None
+            self.demo_resampler = None
+
+        # Demo-text contrastive loss: projection head on the mean demo token, learned temperature.
+        # The text anchors are built by build_demo_text_anchors() (training only).
+        if use_vjepa_demo and config.demo_contrastive_weight > 0:
+            hidden = self.qwen.model.config.hidden_size
+            # Output matches the text anchor: [mean-pooled part, last-token part], 2 * hidden.
+            self.demo_proj = nn.Sequential(nn.Linear(hidden, hidden), nn.GELU(), nn.Linear(hidden, 2 * hidden))
+            self.demo_logit_scale = nn.Parameter(torch.tensor(np.log(1.0 / config.demo_contrastive_temperature)))
+        else:
+            self.demo_proj = None
+            self.demo_logit_scale = None
+        self.register_buffer("demo_text_anchors", torch.empty(0), persistent=False)
+        self.register_buffer("demo_anchor_task_ids", torch.empty(0, dtype=torch.long), persistent=False)
 
         if config.freeze_qwen:
             self.qwen.requires_grad_(False)
@@ -130,7 +167,9 @@ class VLAJEPAModel(nn.Module):
             self.config.embodied_action_token * self.config.num_embodied_action_tokens_per_instruction
         )
 
-    def _qwen_last_decoder_hidden(self, qwen_inputs: dict[str, torch.Tensor]) -> torch.Tensor:
+    def _qwen_last_decoder_hidden(
+        self, qwen_inputs: dict[str, torch.Tensor], demo_embeds: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """Return the last decoder hidden state before the final RMSNorm.
 
         The model was trained with the output of the last transformer block BEFORE
@@ -145,8 +184,17 @@ class VLAJEPAModel(nn.Module):
             h = output[0] if isinstance(output, tuple) else output
             captured.append(h)
 
+        def _inject_demo(module, inputs, output):
+            # Replace the embeddings of the <|demo|> placeholders with the resampled demo tokens.
+            mask = inputs[0] == self.demo_token_id
+            output = output.clone()
+            output[mask] = demo_embeds.reshape(-1, output.shape[-1]).to(output.dtype)
+            return output
+
         last_layer = self.qwen.model.model.language_model.layers[-1]
-        handle = last_layer.register_forward_hook(_hook)
+        handles = [last_layer.register_forward_hook(_hook)]
+        if demo_embeds is not None:
+            handles.append(self.qwen.model.get_input_embeddings().register_forward_hook(_inject_demo))
         try:
             self.qwen.model(
                 **qwen_inputs,
@@ -155,9 +203,88 @@ class VLAJEPAModel(nn.Module):
                 return_dict=True,
             )
         finally:
-            handle.remove()
+            for handle in handles:
+                handle.remove()
 
         return captured[0]  # [B, seq_len, H]
+
+    @torch.no_grad()
+    def build_demo_text_anchors(self, instructions: list[str], task_ids: list[int]) -> None:
+        """Text anchors t_c from the frozen base Qwen, one per training task instruction.
+
+        t_c = [mean hidden state at layer `demo_anchor_mean_layer`, last-token hidden state at layer
+        `demo_anchor_last_layer`], each centred over the tasks and L2-normalised (see config).
+        Called once at construction, before any checkpoint weights are loaded, so the anchors always come
+        from the same pretrained Qwen (identical on every rank and after every resume) and never drift.
+        """
+        tokenizer = self.qwen.processor.tokenizer  # left padding: position -1 is the last real token
+        enc = tokenizer(list(instructions), padding=True, return_tensors="pt")
+        language_model = self.qwen.model.model.language_model
+        device = next(language_model.parameters()).device
+        out = language_model(
+            input_ids=enc["input_ids"].to(device),
+            attention_mask=enc["attention_mask"].to(device),
+            output_hidden_states=True,
+        )
+        mask = enc["attention_mask"].to(device).unsqueeze(-1).float()
+        mean_part = (out.hidden_states[self.config.demo_anchor_mean_layer].float() * mask).sum(1) / mask.sum(1)
+        last_part = out.hidden_states[self.config.demo_anchor_last_layer][:, -1].float()
+
+        def centre_norm(x: Tensor) -> Tensor:
+            return F.normalize(x - x.mean(0, keepdim=True), dim=-1)
+
+        self.demo_text_anchors = torch.cat([centre_norm(mean_part), centre_norm(last_part)], dim=-1).cpu()
+        self.demo_anchor_task_ids = torch.tensor(task_ids, dtype=torch.long)
+
+    def _demo_text_contrastive(self, demo_embeds: Tensor, labels: Tensor) -> dict[str, Tensor]:
+        """InfoNCE between the projected mean demo token and all text anchors, plus similarity metrics."""
+        valid = labels >= 0
+        z = F.normalize(self.demo_proj(demo_embeds.float().mean(1)), dim=-1)  # [B, H]
+        t = F.normalize(self.demo_text_anchors.to(z.device).float(), dim=-1)  # [C, H]
+        sims = z @ t.T  # [B, C] cosine similarities
+        logits = sims * self.demo_logit_scale.exp().clamp(max=100.0)
+        loss = F.cross_entropy(logits, labels.clamp(min=0), reduction="none")
+        loss = (loss * valid).sum() / valid.sum().clamp(min=1)
+
+        out = {"demo_contrastive_loss": loss * self.config.demo_contrastive_weight}
+        with torch.no_grad():
+            pred = sims.argmax(-1)
+            lab = labels.clamp(min=0)
+            pos = sims.gather(1, lab[:, None]).squeeze(1)
+            neg = sims.masked_fill(F.one_hot(lab, sims.shape[1]).bool(), -2.0).max(-1).values
+            n = valid.sum().clamp(min=1)
+            out["demo_text_acc"] = ((pred == lab) & valid).sum() / n
+            out["demo_text_margin"] = ((pos - neg) * valid).sum() / n
+            out["demo_text_pos_sim"] = (pos * valid).sum() / n
+            out["demo_text_temperature"] = 1.0 / self.demo_logit_scale.exp().clamp(max=100.0)
+            if self.config.demo_task_factors and self.demo_anchor_task_ids.numel():
+                ids = self.demo_anchor_task_ids.to(lab.device)
+                pred_id, true_id = ids[pred], ids[lab]
+                for name, size in reversed(list(self.config.demo_task_factors.items())):
+                    out[f"demo_text_{name}_acc"] = (((pred_id % size) == (true_id % size)) & valid).sum() / n
+                    pred_id, true_id = pred_id // size, true_id // size
+        return out
+
+    def _encode_demos(
+        self, demos: list[tuple[np.ndarray, float]] | None
+    ) -> tuple[str, list[tuple[np.ndarray, float]] | None, Tensor | None]:
+        """Return (demo_prompt, demo_videos for Qwen, demo token embeddings) for build_inputs."""
+        if not self.config.use_demo:
+            return "", None, None
+        if demos is None or any(d is None for d in demos):
+            raise ValueError("conditioning uses a demo video but a sample has no 'demo'.")
+        if self.config.demo_encoder == "qwen_video":
+            return "", demos, None
+
+        frames = np.stack([d[0] for d in demos]).transpose(0, 1, 4, 2, 3)  # [B, T, 3, S, S]
+        pixels = self.video_processor(videos=list(frames), return_tensors="pt")["pixel_values_videos"].to(
+            self.video_encoder.device
+        )
+        with torch.no_grad():
+            feats = self.video_encoder.get_vision_features(pixel_values_videos=pixels)  # [B, T'*P, D]
+        num_temporal = frames.shape[1] // self.video_encoder.config.tubelet_size
+        demo_embeds = self.demo_resampler(feats.float(), num_temporal)  # [B, K, H]
+        return self.config.demo_token * self.config.demo_num_tokens, None, demo_embeds
 
     # ---- Native VLA-JEPA forward (follows original VLA_JEPA.py) ----
 
@@ -179,7 +306,9 @@ class VLAJEPAModel(nn.Module):
         # Unpack native format (same pattern as original VLA_JEPA.py)
         batch_images = [ex["image"] for ex in examples]  # List[List[PIL.Image]]
         batch_videos = [ex["video"] for ex in examples]  # List[np.ndarray]
-        instructions = [ex["lang"] for ex in examples]  # List[str]
+        instructions = [ex["lang"] for ex in examples]  # List[str | None]
+        demos = [ex.get("demo") for ex in examples] if self.config.use_demo else None
+        demo_labels = [ex.get("demo_label", -1) for ex in examples]
         has_action = "action" in examples[0] and examples[0]["action"] is not None
         actions = [ex["action"] for ex in examples] if has_action else None
         has_state = "state" in examples[0] and examples[0]["state"] is not None
@@ -205,12 +334,20 @@ class VLAJEPAModel(nn.Module):
         elif batch_videos.shape[1] > num_views_world_model:
             batch_videos = batch_videos[:, :num_views_world_model]
 
-        # ---- Step 1: QwenVL encode (same as original) ----
+        # ---- Step 1: QwenVL encode (same as original, plus the optional demo video) ----
+        demo_prompt, demo_videos, demo_embeds = self._encode_demos(demos)
+        demo_outputs: dict[str, Tensor] = {}
+        if self.demo_proj is not None and demo_embeds is not None and self.demo_text_anchors.numel():
+            demo_outputs = self._demo_text_contrastive(
+                demo_embeds, torch.tensor(demo_labels, device=demo_embeds.device, dtype=torch.long)
+            )
         qwen_inputs = self.qwen.build_inputs(
             images=batch_images,
             instructions=instructions,
             action_prompt=self.replace_prompt,
             embodied_prompt=self.embodied_replace_prompt,
+            demo_prompt=demo_prompt,
+            demo_videos=demo_videos,
         )
 
         # Locate embodied-action tokens (always needed for action head)
@@ -228,7 +365,7 @@ class VLAJEPAModel(nn.Module):
         device_type = next(self.parameters()).device.type
 
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-            last_hidden = self._qwen_last_decoder_hidden(qwen_inputs)  # [B, seq_len, H]
+            last_hidden = self._qwen_last_decoder_hidden(qwen_inputs, demo_embeds)  # [B, seq_len, H]
             b, _, h = last_hidden.shape
 
             if self.config.enable_world_model:
@@ -282,7 +419,7 @@ class VLAJEPAModel(nn.Module):
                 wm_loss = F.l1_loss(predicted_states, gt_states.float(), reduction="mean")
 
         if not has_action:
-            return {"wm_loss": wm_loss}
+            return {"wm_loss": wm_loss, **demo_outputs}
 
         # ---- Step 4: Action Head ----
         with torch.autocast(device_type=device_type, dtype=torch.float32):
@@ -321,7 +458,11 @@ class VLAJEPAModel(nn.Module):
                 embodied_action_tokens, actions_target, state_tensor, action_is_pad_rep
             )
 
-        return {"action_loss": action_loss, "wm_loss": wm_loss * self.config.world_model_loss_weight}
+        return {
+            "action_loss": action_loss,
+            "wm_loss": wm_loss * self.config.world_model_loss_weight,
+            **demo_outputs,
+        }
 
     # ---- Native predict_action (follows original VLA_JEPA.predict_action) ----
 
@@ -329,8 +470,9 @@ class VLAJEPAModel(nn.Module):
     def predict_action(
         self,
         batch_images: list[list[Image.Image]],
-        instructions: list[str],
+        instructions: list[str | None],
         state: np.ndarray | None = None,
+        demos: list[tuple[np.ndarray, float]] | None = None,
     ) -> np.ndarray:
         """
         Native action prediction following original VLA_JEPA.predict_action.
@@ -339,6 +481,8 @@ class VLAJEPAModel(nn.Module):
             batch_images: List of samples; each is List[PIL.Image] (multi-view).
             instructions: Task instructions, one per sample.
             state: Optional [B, state_dim] numpy array.
+            demos: Per-sample (frames [T, H, W, 3] uint8, fps) demo videos, required when
+                `config.conditioning` uses a demo.
 
         Returns:
             np.ndarray [B, action_horizon, action_dim] — predicted actions.
@@ -351,11 +495,14 @@ class VLAJEPAModel(nn.Module):
                 for sample_images in batch_images
             ]
 
+        demo_prompt, demo_videos, demo_embeds = self._encode_demos(demos)
         qwen_inputs = self.qwen.build_inputs(
             images=batch_images,
             instructions=instructions,
             action_prompt=self.replace_prompt,
             embodied_prompt=self.embodied_replace_prompt,
+            demo_prompt=demo_prompt,
+            demo_videos=demo_videos,
         )
 
         embodied_mask = qwen_inputs["input_ids"] == self.embodied_action_token_id
@@ -364,7 +511,7 @@ class VLAJEPAModel(nn.Module):
         device_type = next(self.parameters()).device.type
 
         with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
-            last_hidden = self._qwen_last_decoder_hidden(qwen_inputs)  # [B, seq_len, H]
+            last_hidden = self._qwen_last_decoder_hidden(qwen_inputs, demo_embeds)  # [B, seq_len, H]
             b, _, h = last_hidden.shape
             embodied_action_tokens = last_hidden[embodied_indices[0], embodied_indices[1], :].view(b, -1, h)
 
@@ -412,10 +559,60 @@ class VLAJEPAPolicy(PreTrainedPolicy):
                 config.action_dim = ds_features[ACTION]["shape"][0]
 
         self.model = VLAJEPAModel(config)
+
+        self.demo_bank = None
+        if config.use_demo:
+            if config.demo_root is None or config.demo_task_map_path is None:
+                raise ValueError("conditioning uses a demo: set `demo_root` and `demo_task_map_path`.")
+            self.demo_bank = DemoVideoBank(
+                root=config.demo_root,
+                task_map_path=config.demo_task_map_path,
+                num_frames=config.demo_num_frames,
+                image_size=config.demo_image_size,
+                num_eval_per_task=config.demo_num_eval_per_task,
+                cache_videos=config.demo_cache_videos,
+            )
+        self._demo_rng = np.random.default_rng()
+
+        # Text anchors for the demo-text contrastive loss: one per training task of the dataset.
+        self._demo_label_index: dict[str, int] = {}
+        if self.model.demo_proj is not None and (dataset_meta := kwargs.get("dataset_meta")) is not None:
+            names = [str(t) for t in dataset_meta.tasks.index]
+            config.demo_contrastive_task_names = names
+            task_ids = [int(self.demo_bank.task_folder(n).split("_")[-1]) for n in names]
+            self.model.build_demo_text_anchors(names, task_ids)
+            self._demo_label_index = {normalize_instruction(n): i for i, n in enumerate(names)}
         self.reset()
 
     def reset(self) -> None:
         self._queues = {ACTION: deque(maxlen=self.config.n_action_steps)}
+        # The demo is chosen once per episode and kept for all of its steps.
+        self._episode_demos: dict[str, tuple[np.ndarray, float]] = {}
+
+    def _get_demo(self, instruction: str) -> tuple[np.ndarray, float]:
+        if self.training:
+            return self.demo_bank.sample(instruction, training=True, rng=self._demo_rng)
+        if instruction not in self._episode_demos:
+            self._episode_demos[instruction] = self.demo_bank.sample(instruction, training=False)
+            self._save_test_demo(instruction, self._episode_demos[instruction])
+        return self._episode_demos[instruction]
+
+    def _save_test_demo(self, instruction: str, demo: tuple[np.ndarray, float]) -> None:
+        """At test time only, if VLA_JEPA_DEMO_SAVE_DIR is set, save the demo frames given to the model."""
+        save_root = os.environ.get("VLA_JEPA_DEMO_SAVE_DIR")
+        if not save_root:
+            return
+        self._saved_demo_count = getattr(self, "_saved_demo_count", 0) + 1
+        info = dict(self.demo_bank.last_sample or {})
+        out = Path(save_root) / f"episode_{self._saved_demo_count:04d}_{info.get('task_folder', 'demo')}"
+        out.mkdir(parents=True, exist_ok=True)
+        frames, fps = demo
+        for k, frame in enumerate(frames):
+            Image.fromarray(frame).save(out / f"frame_{k:02d}.png")
+        strip = np.concatenate(list(frames), axis=1)  # [S, T*S, 3]
+        Image.fromarray(strip).save(out / "strip.png")
+        info.update({"instruction": instruction, "fps": fps, "shape": list(frames.shape)})
+        (out / "demo.json").write_text(json.dumps(info, indent=2))
 
     # ---- Format Conversion: LeRobot → Native ----
 
@@ -498,6 +695,16 @@ class VLAJEPAPolicy(PreTrainedPolicy):
         else:
             instructions = list(tasks)
 
+        # ---- Collect demo videos (selected by task instruction) ----
+        demos = None
+        if self.config.use_demo:
+            demos = [self._get_demo(instruction) for instruction in instructions]
+            # Contrastive label = index of the task's own text anchor (before any language dropout).
+            demo_labels = [self._demo_label_index.get(normalize_instruction(i), -1) for i in instructions]
+            if self.config.conditioning == "both" and self.training and self.config.language_dropout > 0:
+                keep = self._demo_rng.random(batch_size) >= self.config.language_dropout
+                instructions = [i if k else None for i, k in zip(instructions, keep, strict=True)]
+
         # ---- Collect actions (training only) ----
         actions_list = None
         action_is_pad_list = None
@@ -528,6 +735,9 @@ class VLAJEPAPolicy(PreTrainedPolicy):
                 "video": videos_per_sample[b],
                 "lang": instructions[b],
             }
+            if demos is not None:
+                example["demo"] = demos[b]
+                example["demo_label"] = demo_labels[b]
             if actions_list is not None:
                 example["action"] = actions_list[b]
             if action_is_pad_list is not None:
@@ -547,7 +757,11 @@ class VLAJEPAPolicy(PreTrainedPolicy):
 
         ref = next(iter(native_output.values()))
         zero = torch.zeros((), device=ref.device, dtype=ref.dtype)
-        total_loss = native_output.get("action_loss", zero) + native_output.get("wm_loss", zero)
+        total_loss = (
+            native_output.get("action_loss", zero)
+            + native_output.get("wm_loss", zero)
+            + native_output.get("demo_contrastive_loss", zero)
+        )
         logs = {k: v.detach().item() for k, v in native_output.items()}
         logs["loss"] = total_loss.detach().item()
         return total_loss, logs
@@ -569,7 +783,8 @@ class VLAJEPAPolicy(PreTrainedPolicy):
         if "state" in examples[0] and examples[0]["state"] is not None:
             state_np = np.stack([ex["state"] for ex in examples])
 
-        actions_np = self.model.predict_action(batch_images, instructions, state_np)
+        demos = [ex["demo"] for ex in examples] if self.config.use_demo else None
+        actions_np = self.model.predict_action(batch_images, instructions, state_np, demos)
         return torch.from_numpy(actions_np).to(device=self.config.device, dtype=torch.float32)
 
     @torch.no_grad()

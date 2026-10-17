@@ -1,0 +1,18 @@
+{
+  "Pick the green box and place it into the first bin": "task_00",
+  "Pick the green box and place it into the second bin": "task_01",
+  "Pick the green box and place it into the third bin": "task_02",
+  "Pick the green box and place it into the fourth bin": "task_03",
+  "Pick the yellow box and place it into the first bin": "task_04",
+  "Pick the yellow box and place it into the second bin": "task_05",
+  "Pick the yellow box and place it into the third bin": "task_06",
+  "Pick the yellow box and place it into the fourth bin": "task_07",
+  "Pick the blue box and place it into the first bin": "task_08",
+  "Pick the blue box and place it into the second bin": "task_09",
+  "Pick the blue box and place it into the third bin": "task_10",
+  "Pick the blue box and place it into the fourth bin": "task_11",
+  "Pick the red box and place it into the first bin": "task_12",
+  "Pick the red box and place it into the second bin": "task_13",
+  "Pick the red box and place it into the third bin": "task_14",
+  "Pick the red box and place it into the fourth bin": "task_15"
+}

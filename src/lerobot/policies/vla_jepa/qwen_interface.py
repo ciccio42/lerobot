@@ -72,34 +72,94 @@ class Qwen3VLInterface(torch.nn.Module):
             tokenizer.add_tokens([embodied_action_token], special_tokens=True)
         embodied_action_token_id = tokenizer.convert_tokens_to_ids(embodied_action_token)
 
+        # Added last so the ids above (and the checkpoint's embedding rows) are unchanged.
+        if self.config.use_demo and self.config.demo_encoder == "vjepa":
+            if self.config.demo_token not in tokenizer.get_vocab():
+                tokenizer.add_tokens([self.config.demo_token], special_tokens=True)
+
         if self.model.get_input_embeddings().weight.size(0) < len(tokenizer):
             self.model.resize_token_embeddings(len(tokenizer))
         return action_tokens, action_token_ids, embodied_action_token_id
 
+    def _prompt(
+        self, instruction: str | None, action_prompt: str, embodied_prompt: str, demo_prompt: str
+    ) -> str:
+        if not self.config.use_demo:
+            return self.config.prompt_template.format(
+                instruction=instruction, actions=action_prompt, e_actions=embodied_prompt
+            )
+        instruction_part = (
+            self.config.demo_instruction_template.format(instruction=instruction)
+            if self.config.conditioning == "both" and instruction is not None
+            else ""
+        )
+        return self.config.demo_prompt_template.format(
+            demo=demo_prompt, instruction=instruction_part, actions=action_prompt, e_actions=embodied_prompt
+        )
+
     def build_inputs(
         self,
         images: Sequence[Sequence[Image.Image]],
-        instructions: Sequence[str],
+        instructions: Sequence[str | None],
         action_prompt: str,
         embodied_prompt: str,
+        demo_prompt: str = "",
+        demo_videos: Sequence[tuple[np.ndarray, float]] | None = None,
     ) -> dict[str, torch.Tensor]:
+        """Build Qwen3-VL inputs.
+
+        demo_prompt: text put at the `{demo}` slot of `demo_prompt_template` (the <|demo|> placeholders
+            for the V-JEPA demo encoder).
+        demo_videos: per-sample (frames [T, H, W, 3] uint8, fps) for the native Qwen video demo encoder;
+            the video is inserted at the `{demo}` slot.
+        """
+        video_marker = "\x00DEMO_VIDEO\x00"
         messages = []
         for sample_images, instruction in zip(images, instructions, strict=True):
-            prompt = self.config.prompt_template.format(
-                instruction=instruction,
-                actions=action_prompt,
-                e_actions=embodied_prompt,
+            prompt = self._prompt(
+                instruction,
+                action_prompt,
+                embodied_prompt,
+                video_marker if demo_videos is not None else demo_prompt,
             )
             content = [{"type": "image", "image": img} for img in sample_images]
-            content.append({"type": "text", "text": prompt})
+            if demo_videos is not None:
+                before, after = prompt.split(video_marker)
+                content += [
+                    {"type": "text", "text": before},
+                    {"type": "video"},
+                    {"type": "text", "text": after},
+                ]
+            else:
+                content.append({"type": "text", "text": prompt})
             messages.append([{"role": "user", "content": content}])
 
-        batch_inputs = self.processor.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_dict=True,
-            processor_kwargs={"padding": True, "return_tensors": "pt"},
+        if demo_videos is None:
+            batch_inputs = self.processor.apply_chat_template(
+                messages,
+                tokenize=True,
+                add_generation_prompt=True,
+                return_dict=True,
+                processor_kwargs={"padding": True, "return_tensors": "pt"},
+            )
+            return batch_inputs.to(self.model.device)
+
+        # Pre-sampled demo frames: pass them to the processor directly, with metadata so that the
+        # Qwen3-VL frame timestamps in the prompt reflect the demo's real timing.
+        texts = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        batch_inputs = self.processor(
+            text=texts,
+            images=[img for sample_images in images for img in sample_images],
+            videos=[frames for frames, _ in demo_videos],
+            videos_kwargs={
+                "do_sample_frames": False,
+                "video_metadata": [
+                    {"fps": fps, "total_num_frames": len(frames), "frames_indices": list(range(len(frames)))}
+                    for frames, fps in demo_videos
+                ],
+            },
+            padding=True,
+            return_tensors="pt",
         )
         return batch_inputs.to(self.model.device)
 

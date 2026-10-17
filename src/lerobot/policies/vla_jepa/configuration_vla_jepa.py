@@ -83,6 +83,47 @@ class VLAJEPAConfig(PreTrainedConfig):
     jepa_tubelet_size: int = 2  # must match the encoder (e.g. 2 for vjepa2-vitl-fpc64-256)
     repeated_diffusion_steps: int = 8  # independent noise draws per batch item (CogACT-style)
 
+    # ---- Demo-video conditioning (replaces / complements the language instruction l in Eq. 2 and 6) ----
+    # "language": original VLA-JEPA. "demo": the demonstration video replaces the instruction in the
+    # prompt. "both": demo + instruction, with the instruction dropped with prob `language_dropout`.
+    conditioning: str = "language"
+    # "vjepa": demo -> frozen V-JEPA2 encoder -> DemoResampler -> <|demo|> token embeddings (option A).
+    # "qwen_video": demo frames fed to Qwen3-VL as a native video input (option C, baseline).
+    demo_encoder: str = "vjepa"
+    # Folder with one sub-folder per task (<task_folder>/*.mp4), e.g. human_rgb_pick_place/video.
+    demo_root: str | None = None
+    # JSON {instruction: task_folder}; the instruction string of each sample selects which task's demo
+    # to use (task_index is not usable: datasets with removed tasks renumber it).
+    demo_task_map_path: str | None = None
+    demo_num_frames: int = 16
+    demo_image_size: int | None = None  # None -> 256 for vjepa, 224 for qwen_video
+    # The last `demo_num_eval_per_task` videos of each task folder are reserved for evaluation.
+    demo_num_eval_per_task: int = 8
+    demo_cache_videos: bool = True
+    demo_token: str = "<|demo|>"
+    demo_num_tokens: int = 64
+    demo_resampler_depth: int = 2
+    demo_resampler_num_heads: int = 16
+    demo_prompt_template: str = "The demonstration {demo} shows your task.{instruction} Infer the temporal dynamics from frames {actions} and produce the corresponding policy actions {e_actions}."
+    demo_instruction_template: str = " In words, your task is {instruction}."
+    language_dropout: float = 0.0
+    # Demo-text contrastive loss (option A only): InfoNCE between the projected mean of the demo tokens
+    # and frozen text anchors (base Qwen hidden states of each training task's instruction); the
+    # negatives are the instructions of all the other training tasks. 0 disables it.
+    demo_contrastive_weight: float = 0.0
+    demo_contrastive_temperature: float = 0.07  # initial value, learned
+    # Text anchor = concat of [mean hidden state over the instruction at `demo_anchor_mean_layer`,
+    # last-token hidden state at `demo_anchor_last_layer`], each centred over the tasks and L2-normalised.
+    # Mean pooling mostly encodes the object (colour), the last token mostly the target (bin); raw
+    # anchors of these near-identical instructions have cosine >= 0.998 and would not discriminate.
+    demo_anchor_mean_layer: int = 20
+    demo_anchor_last_layer: int = 28
+    # Filled at training time from the dataset's tasks (saved with the checkpoint for reference).
+    demo_contrastive_task_names: list[str] | None = None
+    # Optional factorization of the demo task id (folder task_XX) for the similarity metrics, most
+    # significant factor first, e.g. {"color": 4, "bin": 4} -> color = id // 4, bin = id % 4.
+    demo_task_factors: dict[str, int] | None = None
+
     resize_images_to: tuple[int, int] | None = None
     binarize_gripper_action: bool = True
     pre_snap_gripper_action: bool = True
@@ -112,6 +153,16 @@ class VLAJEPAConfig(PreTrainedConfig):
                 f"`video_horizon` ({self.num_video_frames}) must be >= 2 * `jepa_tubelet_size` "
                 f"({self.jepa_tubelet_size}) to have at least one context and one GT temporal position."
             )
+        if self.conditioning not in ("language", "demo", "both"):
+            raise ValueError(f"`conditioning` must be 'language', 'demo' or 'both', got {self.conditioning!r}.")
+        if self.demo_encoder not in ("vjepa", "qwen_video"):
+            raise ValueError(f"`demo_encoder` must be 'vjepa' or 'qwen_video', got {self.demo_encoder!r}.")
+        if self.demo_image_size is None:
+            self.demo_image_size = 256 if self.demo_encoder == "vjepa" else 224
+
+    @property
+    def use_demo(self) -> bool:
+        return self.conditioning in ("demo", "both")
 
     def validate_features(self) -> None:
         if not self.image_features:

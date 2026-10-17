@@ -53,6 +53,7 @@ import concurrent.futures as cf
 import json
 import logging
 import os
+import pickle
 import threading
 import time
 from collections import defaultdict
@@ -114,6 +115,7 @@ def rollout(
     return_observations: bool = False,
     render_callback: Callable[[gym.vector.VectorEnv], None] | None = None,
     debug_images_dir: Path | None = None,
+    record_robot_state: bool = False,
 ) -> dict:
     """Run a batched policy rollout once through a batch of environments.
 
@@ -159,6 +161,9 @@ def rollout(
     if render_callback is not None:
         render_callback(env)
 
+    # Raw robot state (env frame) per step, for trajectory dumps (see `trajectories_dir` in eval_policy).
+    all_robot_states: list[dict[str, np.ndarray]] = []
+
     all_observations = []
     all_actions = []
     all_rewards = []
@@ -177,6 +182,8 @@ def rollout(
     )
     check_env_attributes_and_types(env)
     while not np.all(done) and step < max_steps:
+        if record_robot_state and (snap := _robot_state_snapshot(observation)) is not None:
+            all_robot_states.append(snap)
         # Numpy array to tensor and changing dictionary keys to LeRobot policy format.
         observation = preprocess_observation(observation)
 
@@ -263,6 +270,9 @@ def rollout(
         progbar.set_postfix({"running_success_rate": f"{running_success_rate.item() * 100:.1f}%"})
         progbar.update()
 
+    if record_robot_state and (snap := _robot_state_snapshot(observation)) is not None:
+        all_robot_states.append(snap)  # state after the last action
+
     # Track the final observation.
     if return_observations:
         observation = preprocess_observation(observation)
@@ -281,10 +291,57 @@ def rollout(
             stacked_observations[key] = torch.stack([obs[key] for obs in all_observations], dim=1)
         ret[OBS_STR] = stacked_observations
 
+    if record_robot_state and all_robot_states:
+        # (batch, n_steps + 1, dim): index t is the state BEFORE action t, the last one follows the last action
+        ret["robot_state"] = {k: np.stack([snap[k] for snap in all_robot_states], axis=1) for k in all_robot_states[0]}
+
     if hasattr(policy, "use_original_modules"):
         policy.use_original_modules()
 
     return ret
+
+
+def _robot_state_snapshot(observation) -> dict[str, np.ndarray] | None:
+    """End-effector pose, gripper and joints from a raw (batched) env observation, when the env exposes them
+    (LIBERO / LIBERO-plus `robot_state`, world frame). None for other envs."""
+    robot_state = observation.get("robot_state") if isinstance(observation, dict) else None
+    if not isinstance(robot_state, dict):
+        return None
+    snap = {}
+    for name, (group, key) in {
+        "eef_pos": ("eef", "pos"),
+        "eef_quat": ("eef", "quat"),
+        "gripper_qpos": ("gripper", "qpos"),
+        "joint_pos": ("joints", "pos"),
+    }.items():
+        value = robot_state.get(group, {}).get(key) if isinstance(robot_state.get(group), dict) else None
+        if value is not None:
+            snap[name] = np.array(value, dtype=np.float32, copy=True)
+    return snap or None
+
+
+def _save_trajectories(trajectories_dir, env, rollout_data, done_indices, batch_successes, batch_ix, seeds):
+    """One pickle per episode with the robot trajectory (for e.g. gripper XY heat-maps):
+    eef_pos (T+1, 3) / eef_quat (T+1, 4) / gripper_qpos (T+1, 2) / joint_pos, world frame, where index t is
+    the state before action t and T = number of executed actions; actions (T, 7); success; task description."""
+    trajectories_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        tasks = list(env.call("task_description"))
+    except (AttributeError, NotImplementedError):
+        tasks = [""] * env.num_envs
+    for i in range(env.num_envs):
+        n_actions = int(done_indices[i]) + 1
+        episode = {
+            "task_description": tasks[i] if i < len(tasks) else "",
+            "episode_index": batch_ix * env.num_envs + i,
+            "seed": seeds[i] if seeds else None,
+            "success": bool(batch_successes[i]),
+            "actions": rollout_data[ACTION][i, :n_actions].numpy(),
+        }
+        for k, v in rollout_data["robot_state"].items():
+            episode[k] = v[i, : n_actions + 1]
+        with open(trajectories_dir / f"eval_episode_{episode['episode_index']}.pkl", "wb") as f:
+            pickle.dump(episode, f)
 
 
 def eval_policy(
@@ -300,6 +357,7 @@ def eval_policy(
     return_episode_data: bool = False,
     start_seed: int | None = None,
     debug_images_dir: Path | None = None,
+    trajectories_dir: Path | None = None,
 ) -> dict:
     """
     Args:
@@ -391,6 +449,7 @@ def eval_policy(
             return_observations=return_episode_data,
             render_callback=render_frame if max_episodes_rendered > 0 else None,
             debug_images_dir=debug_images_dir / f"batch{batch_ix}" if debug_images_dir is not None else None,
+            record_robot_state=trajectories_dir is not None,
         )
 
         # Figure out where in each rollout sequence the first done condition was encountered (results after
@@ -413,6 +472,10 @@ def eval_policy(
             all_seeds.extend(seeds)
         else:
             all_seeds.append(None)
+
+        if trajectories_dir is not None and "robot_state" in rollout_data:
+            _save_trajectories(trajectories_dir, env, rollout_data, done_indices, batch_successes,
+                               batch_ix, list(seeds) if seeds else None)
 
         # FIXME: episode_data is either None or it doesn't exist
         if return_episode_data:
@@ -600,6 +663,10 @@ def eval_main(cfg: EvalPipelineConfig):
             colored("Debug images:", "yellow", attrs=["bold"]) + f" saving policy input views to {debug_images_dir}"
         )
 
+    # LEROBOT_EVAL_SAVE_TRAJ=1: one pickle per episode with the robot trajectory (see _save_trajectories),
+    # under <output_dir>/trajectories/<task_group>_<task_id>/eval_episode_<i>.pkl
+    trajectories_dir = Path(cfg.output_dir) / "trajectories" if os.environ.get("LEROBOT_EVAL_SAVE_TRAJ") == "1" else None
+
     with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext():
         info = eval_policy_all(
             envs=envs,
@@ -609,11 +676,13 @@ def eval_main(cfg: EvalPipelineConfig):
             preprocessor=preprocessor,
             postprocessor=postprocessor,
             n_episodes=cfg.eval.n_episodes,
-            max_episodes_rendered=10,
+            # per task; LEROBOT_EVAL_MAX_RENDERED=0 disables videos (e.g. LIBERO-plus, 1 episode x 10k variants)
+            max_episodes_rendered=int(os.environ.get("LEROBOT_EVAL_MAX_RENDERED", "10")),
             videos_dir=Path(cfg.output_dir) / "videos",
             start_seed=cfg.seed,
             max_parallel_tasks=cfg.env.max_parallel_tasks,
             debug_images_dir=debug_images_dir,
+            trajectories_dir=trajectories_dir,
         )
         print("Overall Aggregated Metrics:")
         print(info["overall"])
@@ -657,6 +726,7 @@ def eval_one(
     return_episode_data: bool,
     start_seed: int | None,
     debug_images_dir: Path | None = None,
+    trajectories_dir: Path | None = None,
 ) -> TaskMetrics:
     """Evaluates one task_id of one suite using the provided vec env."""
 
@@ -675,6 +745,7 @@ def eval_one(
         return_episode_data=return_episode_data,
         start_seed=start_seed,
         debug_images_dir=debug_images_dir,
+        trajectories_dir=trajectories_dir,
     )
 
     per_episode = task_result["per_episode"]
@@ -702,6 +773,7 @@ def run_one(
     return_episode_data: bool,
     start_seed: int | None,
     debug_images_dir: Path | None = None,
+    trajectories_dir: Path | None = None,
 ):
     """
     Run eval_one for a single (task_group, task_id, env).
@@ -714,6 +786,7 @@ def run_one(
         task_videos_dir.mkdir(parents=True, exist_ok=True)
 
     task_debug_images_dir = debug_images_dir / f"{task_group}_{task_id}" if debug_images_dir is not None else None
+    task_trajectories_dir = trajectories_dir / f"{task_group}_{task_id}" if trajectories_dir is not None else None
 
     # Call the existing eval_one (assumed to return TaskMetrics-like dict)
     metrics = eval_one(
@@ -729,6 +802,7 @@ def run_one(
         return_episode_data=return_episode_data,
         start_seed=start_seed,
         debug_images_dir=task_debug_images_dir,
+        trajectories_dir=task_trajectories_dir,
     )
     # ensure we always provide video_paths key to simplify accumulation
     if max_episodes_rendered > 0:
@@ -751,6 +825,7 @@ def eval_policy_all(
     start_seed: int | None = None,
     max_parallel_tasks: int = 1,
     debug_images_dir: Path | None = None,
+    trajectories_dir: Path | None = None,
 ) -> dict:
     """
     Evaluate a nested `envs` dict: {task_group: {task_id: vec_env}}.
@@ -807,6 +882,7 @@ def eval_policy_all(
         return_episode_data=return_episode_data,
         start_seed=start_seed,
         debug_images_dir=debug_images_dir,
+        trajectories_dir=trajectories_dir,
     )
 
     if max_parallel_tasks <= 1:
