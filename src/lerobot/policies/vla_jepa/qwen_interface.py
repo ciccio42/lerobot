@@ -14,12 +14,12 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
-from PIL import Image
 
 from lerobot.utils.import_utils import _transformers_available
 
@@ -38,19 +38,11 @@ class Qwen3VLInterface(torch.nn.Module):
         self.config = config
         self.model = Qwen3VLForConditionalGeneration.from_pretrained(
             config.qwen_model_name,
-            torch_dtype=self._get_torch_dtype(config.torch_dtype),
+            torch_dtype=config.dtype,
         )
         self.processor = AutoProcessor.from_pretrained(config.qwen_model_name)
         self.processor.tokenizer.padding_side = config.tokenizer_padding_side
         self.model.config.hidden_size = self.model.config.text_config.hidden_size
-
-    @staticmethod
-    def _get_torch_dtype(dtype_name: str) -> torch.dtype:
-        if dtype_name == "float32":
-            return torch.float32
-        if dtype_name == "float16":
-            return torch.float16
-        return torch.bfloat16
 
     def expand_tokenizer(self) -> tuple[list[str], list[int], int]:
         # starVLA/JEVLA checkpoints expand action tokens as action_horizon * 4,
@@ -77,7 +69,20 @@ class Qwen3VLInterface(torch.nn.Module):
             if self.config.demo_token not in tokenizer.get_vocab():
                 tokenizer.add_tokens([self.config.demo_token], special_tokens=True)
 
-        if self.model.get_input_embeddings().weight.size(0) < len(tokenizer):
+        # Qwen3-VL-2B ships 267 spare embedding rows, so the `chunk_size * 4 + 1` added tokens fit
+        # without a resize up to chunk_size=66. Past that, resizing changes the `embed_tokens` /
+        # `lm_head` shapes and checkpoints stop loading across chunk sizes unless those prefixes are
+        # in `reinit_modules` — warn instead of failing silently.
+        current_rows = self.model.get_input_embeddings().weight.size(0)
+        if current_rows < len(tokenizer):
+            logging.warning(
+                f"chunk_size={self.config.chunk_size} needs {max_action_tokens + 1} added tokens, "
+                f"which exceeds the {current_rows} embedding rows of {self.config.qwen_model_name}. "
+                f"Resizing to {len(tokenizer)} rows changes the shapes of "
+                f"`model.qwen.model.model.language_model.embed_tokens` and "
+                f"`model.qwen.model.lm_head`, so this model will not load from a checkpoint trained "
+                f"with a different chunk_size unless those prefixes are in `reinit_modules`."
+            )
             self.model.resize_token_embeddings(len(tokenizer))
         return action_tokens, action_token_ids, embodied_action_token_id
 
@@ -99,7 +104,9 @@ class Qwen3VLInterface(torch.nn.Module):
 
     def build_inputs(
         self,
-        images: Sequence[Sequence[Image.Image]],
+        # Images are on-device float [0, 1] tensors from `to_pixel_values` (#3750), not PIL — the
+        # whole adapter layer (`VLAJEPAPolicy._prepare_model_inputs`) feeds this pipeline.
+        images: Sequence[Sequence[torch.Tensor]],
         instructions: Sequence[str | None],
         action_prompt: str,
         embodied_prompt: str,
@@ -135,12 +142,19 @@ class Qwen3VLInterface(torch.nn.Module):
             messages.append([{"role": "user", "content": content}])
 
         if demo_videos is None:
+            # On-device, do_rescale=False: images already arrive as float in [0, 1] via
+            # `to_pixel_values` (#3750), so skip the processor's /255 rescale and GPU roundtrip.
             batch_inputs = self.processor.apply_chat_template(
                 messages,
                 tokenize=True,
                 add_generation_prompt=True,
                 return_dict=True,
-                processor_kwargs={"padding": True, "return_tensors": "pt"},
+                processor_kwargs={
+                    "padding": True,
+                    "return_tensors": "pt",
+                    "device": self.model.device,
+                    "do_rescale": False,
+                },
             )
             return batch_inputs.to(self.model.device)
 
@@ -158,20 +172,28 @@ class Qwen3VLInterface(torch.nn.Module):
                     for frames, fps in demo_videos
                 ],
             },
+            do_rescale=False,
+            device=self.model.device,
             padding=True,
             return_tensors="pt",
         )
         return batch_inputs.to(self.model.device)
 
     @staticmethod
-    def tensor_to_pil(image_tensor: torch.Tensor) -> Image.Image:
-        image = image_tensor.detach().cpu()
-        if image.ndim == 3 and image.shape[0] in (1, 3):
-            image = image.permute(1, 2, 0)
-        image = image.float()
-        if image.max() <= 1.0:
-            image = image * 255.0
-        image = image.clamp(0, 255).round().to(torch.uint8).numpy()
-        if image.shape[-1] == 1:
-            image = np.repeat(image, 3, axis=-1)
-        return Image.fromarray(image)
+    def to_pixel_values(image_tensor: torch.Tensor) -> torch.Tensor:
+        """Prepare an image/video tensor for the fast processors (used with do_rescale=False).
+
+        The dataset decoder yields float32 in [0, 1] (channels-first) and VISUAL
+        normalization is IDENTITY, so the tensor already arrives in [0, 1]; we pass it
+        through as float and let the processors normalize (no rescale, no uint8
+        quantization). A single channel is expanded to 3 to match the RGB processors.
+
+        Works for any channels-first layout (channel dim is -3): [C, H, W], [B, C, H, W],
+        [T, C, H, W], [B, V, T, C, H, W], ...
+        """
+        image = image_tensor.detach().float()
+        if image.shape[-3] == 1:
+            repeats = [1] * image.ndim
+            repeats[-3] = 3
+            image = image.repeat(*repeats)
+        return image
